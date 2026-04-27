@@ -15,11 +15,9 @@ This project extends a previous [GPT-2 modernisation](https://github.com/lealal/
 | Run | Attention | Status |
 |-----|-----------|--------|
 | `gqa-xsa` | GQA + XSA | ✅ Trained |
-| `gqa` | GQA (baseline) | 🔜 Next |
-| `mha` | Multi-Head Attention | 📋 Planned |
+| `gqa` | GQA (baseline) | ✅ Trained |
+| `mha` | Multi-Head Attention | 🔜 Next |
 | `mha-xsa` | Multi-Head Attention + XSA | 📋 Planned |
-
-Results and a side-by-side loss / perplexity comparison will be added once all runs are complete.
 
 ---
 
@@ -74,7 +72,9 @@ This keeps only the part of the context vector that is orthogonal to the token's
 
 ---
 
-## GQA + XSA Results
+## Results
+
+### GQA + XSA
 
 ![GQA + XSA training curves](assets/gqa-xsa-training.png)
 
@@ -83,7 +83,17 @@ This keeps only the part of the context vector that is orthogonal to the token's
 | Loss | 5.27 | 5.00 |
 | Perplexity | ~195 | ~149 |
 
-Training ran for ~160 000 steps (1 epoch over a subset of RedPajama). The validation loss converges smoothly without overfitting, suggesting XSA does not destabilise training at this scale.
+### GQA (baseline)
+
+| Metric | Final Val |
+|--------|-----------|
+| Loss | ~5.00 |
+
+### GQA vs GQA + XSA
+
+![GQA vs GQA + XSA comparison](assets/gqa-comparison.png)
+
+Both configurations converge to a similar final validation loss (~5.00) over 160 000 steps. GQA (baseline) converges noticeably faster — reaching near-final loss around step 80 000 — while GQA + XSA takes roughly 120 000–130 000 steps to reach the same level. This suggests XSA slows convergence at this scale without a measurable accuracy benefit, though more training steps or a larger model may tell a different story.
 
 ---
 
@@ -93,7 +103,9 @@ Training ran for ~160 000 steps (1 epoch over a subset of RedPajama). The valida
 gqa-xsa.ipynb          # GQA + XSA training notebook
 gqa-xsa-metrics.json   # Logged losses and perplexities
 gqa-xsa.pth            # Saved checkpoint
-gqa.ipynb              # GQA baseline notebook (in progress)
+gqa.ipynb              # GQA baseline training notebook
+gqa-metrics.json       # Logged losses and perplexities
+gqa.pth                # Saved checkpoint
 llm_module.py          # Shared model, training, and generation code
 assets/                # Charts and figures
 ```
