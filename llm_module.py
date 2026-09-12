@@ -80,6 +80,68 @@ class MLP(nn.Module):
         x = torch.nn.functional.silu(fc1_x) * fc2_x
         return self.fc3(x)
 
+class MoE(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.num_experts = cfg['n_experts']
+        self.num_experts_token = cfg['n_experts_token']
+        self.emb_dim = cfg['emb_dim']
+
+        self.router = nn.Linear(cfg['emb_dim'], cfg['n_experts'], bias=False, dtype=cfg['dtype'])
+        self.fc1 = nn.ModuleList(
+            [nn.Linear(cfg['emb_dim'], cfg['hidden_dim'], bias=False, dtype=cfg['dtype']) for _ in range(cfg['n_experts'])]
+        )
+        self.fc2 = nn.ModuleList(
+            [nn.Linear(cfg['emb_dim'], cfg['hidden_dim'], bias=False, dtype=cfg['dtype']) for _ in range(cfg['n_experts'])]
+        )
+        self.fc3 = nn.ModuleList(
+            [nn.Linear(cfg['hidden_dim'], cfg['emb_dim'], bias=False, dtype=cfg['dtype']) for _ in range(cfg['n_experts'])]
+        )
+
+    def forward(self, x):
+        b, num_tokens, d = x.shape
+        scores = self.router(x) # (b, num_tokens, n_experts)
+        topk_scores, topk_indices = torch.topk(scores, self.num_experts_token, dim=-1)
+        topk_probas = torch.softmax(topk_scores, dim=-1)
+
+        x_flat = x.reshape(b * num_tokens, d) # (T, d)
+        out_flat = torch.zeros(b * num_tokens, d, device=x.device, dtype=x.dtype) # (T, d)
+
+        top_indices_flat = topk_indices.reshape(-1, self.num_experts_token) #(T, k)
+        top_probas_flat = topk_probas.reshape(-1, self.num_experts_token) # (T, k)
+
+        experts = torch.unique(top_indices_flat)
+
+        for expert in experts:
+            expert_id = int(expert.item())
+
+            # mask to get the tokens that are routed to this expert
+            mask = top_indices_flat == expert_id
+            if not mask.any():
+                continue
+
+            # get the indices of the tokens that are routed to this expert
+            token_mask = mask.any(dim=-1)
+            selected_idx = token_mask.nonzero(as_tuple=False).squeeze(-1)
+            if selected_idx.numel() == 0:
+                continue
+
+            expert_input = x_flat.index_select(0, selected_idx)
+            hidden = torch.nn.functional.silu(self.fc1[expert_id](expert_input)) * self.fc2[expert_id](expert_input)
+            expert_out = self.fc3[expert_id](hidden)
+
+            # get the probabilities of the selected tokens for this expert
+            mask_selected = mask[selected_idx]
+            slot_indices = mask_selected.int().argmax(dim=-1, keepdim=True)
+            selected_probs = torch.gather(
+                top_probas_flat.index_select(0, selected_idx), dim=-1, index=slot_indices
+            ).squeeze(-1)
+
+            out_flat.index_add_(0, selected_idx, expert_out * selected_probs.unsqueeze(-1))
+
+        return out_flat.reshape(b, num_tokens, self.emb_dim)
+            
+
 def compute_rope(head_dim, theta_base=10_000, context_length=512):
     inv_freq = 1.0 / (theta_base ** (torch.arange(0, head_dim, 2).float()) / head_dim) # (head_dim / 2)
 
@@ -176,6 +238,65 @@ class GroupedQueryAttention(nn.Module):
         context_vector = context_vector.transpose(1,2).reshape(b, seq_len, self.d_out)
         return self.out_proj(context_vector), next_cache
 
+class MultiHeadAttention(nn.Module):
+    def __init__(self, emb_dim, context_size, num_heads, dtype, xsa=True):
+        super().__init__()
+        assert emb_dim % num_heads == 0, 'emb_dim must be divisible by num_heads'
+
+        self.head_dim = emb_dim // num_heads
+        self.num_heads = num_heads
+        self.d_out = self.head_dim * num_heads
+
+        self.W_query = nn.Linear(emb_dim, self.d_out, bias=False, dtype=dtype)
+        self.W_key = nn.Linear(emb_dim, self.d_out, bias=False, dtype=dtype)
+        self.W_value = nn.Linear(emb_dim, self.d_out, bias=False, dtype=dtype)
+
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+
+        self.out_proj = nn.Linear(self.d_out, emb_dim, bias=False, dtype=dtype)
+
+        self.xsa = xsa
+    
+    def forward(self, x, cos, sin, start_pos=0, cache=None):
+        b, num_tokens, d_in = x.shape
+
+        queries = self.W_query(x)
+        keys = self.W_key(x)
+        values = self.W_value(x)
+
+        queries = queries.view(b, num_tokens, self.num_heads, self.head_dim).transpose(1,2)
+        new_keys = keys.view(b, num_tokens, self.num_heads, self.head_dim).transpose(1,2)
+        new_values = values.view(b, num_tokens, self.num_heads, self.head_dim).transpose(1,2)
+
+        queries = self.q_norm(queries)
+        new_keys = self.k_norm(new_keys)
+
+        queries = apply_rope(queries, cos, sin, start_pos)
+        new_keys = apply_rope(new_keys, cos, sin, start_pos)
+
+        if cache is None:
+            keys, values = new_keys, new_values
+        else:
+            k_cache, v_cache = cache
+            keys = torch.cat([k_cache, new_keys], dim=2)
+            values = torch.cat([v_cache, new_values], dim=2)
+        next_cache = keys, values
+
+        is_causal = cache is None
+        context_vector = torch.nn.functional.scaled_dot_product_attention(
+            queries, keys, values, is_causal=is_causal
+        )
+
+        # Apply exclusive self attention (xsa)
+        if self.xsa:
+            Vn = torch.nn.functional.normalize(new_values, dim=-1)
+            context_vector = context_vector - (context_vector * Vn).sum(dim=-1, keepdim=True) * Vn
+
+        context_vector = context_vector.transpose(1,2).reshape(b, num_tokens, self.d_out)
+        return self.out_proj(context_vector), next_cache
+
+
 class Transformer(nn.Module):
     def __init__(self, cfg, xsa=True):
         super().__init__()
@@ -205,6 +326,62 @@ class Transformer(nn.Module):
         x = x + shortcut
         return x, next_cache
 
+class TransformerMHA(nn.Module):
+    def __init__(self, cfg, xsa=True):
+        super().__init__()
+        self.norm1 = RMSNorm(cfg['emb_dim'])
+        self.norm2 = RMSNorm(cfg['emb_dim'])
+        self.att = MultiHeadAttention(
+            emb_dim=cfg['emb_dim'],
+            context_size=cfg['context_length'],
+            num_heads=cfg['n_heads'],
+            dtype=cfg['dtype'],
+            xsa=xsa
+        )
+
+        self.mlp = MLP(cfg['emb_dim'], cfg['hidden_dim'], dtype=cfg['dtype'])
+    
+    def forward(self, x, cos, sin, pos_start=0, cache=None):
+        shortcut = x
+        x = self.norm1(x)
+        x, next_cache = self.att(x, cos, sin, pos_start, cache)
+        x = x + shortcut
+
+        shortcut = x
+        x = self.norm2(x)
+        x = self.mlp(x)
+        x = x + shortcut
+        return x, next_cache
+
+class TransformerMoE(nn.Module):
+    def __init__(self, cfg, xsa=False):
+        super().__init__()
+        self.norm1 = RMSNorm(cfg['emb_dim'])
+        self.norm2 = RMSNorm(cfg['emb_dim'])
+
+        self.att = GroupedQueryAttention(
+            emb_dim=cfg['emb_dim'],
+            context_size=cfg['context_length'],
+            num_heads=cfg['n_heads'],
+            num_kv_groups=cfg['n_kv_groups'],
+            dtype=cfg['dtype'],
+            xsa=xsa
+        )
+
+        self.moe = MoE(cfg)
+
+    def forward(self, x, cos, sin, pos_start=0, cache=None):
+        shortcut = x
+        x = self.norm1(x)
+        x, next_cache = self.att(x, cos, sin, pos_start, cache)
+        x = x + shortcut
+
+        shortcut = x
+        x = self.norm2(x)
+        x = self.moe(x)
+        x = x + shortcut
+        return x, next_cache
+
 class KVCache:
     def __init__(self, n_layers):
         self.cache = [None] * n_layers
@@ -230,6 +407,110 @@ class Model(nn.Module):
         self.tok_emb = nn.Embedding(cfg['vocab_size'], cfg['emb_dim'], dtype=cfg['dtype'])
         self.trf_blocks = nn.ModuleList(
             [Transformer(cfg, xsa) for _ in range(cfg['n_layers'])]
+        )
+        self.norm = RMSNorm(cfg['emb_dim'])
+        self.out_head = nn.Linear(
+            cfg['emb_dim'], cfg['vocab_size'], bias=False, dtype=cfg['dtype']
+        )
+
+        # weight tying
+        self.out_head.weight = self.tok_emb.weight
+
+        head_dim = cfg['emb_dim'] // cfg['n_heads']
+
+        cos, sin = compute_rope(
+            head_dim, theta_base=10_000, context_length=cfg['context_length']
+        )
+
+        self.register_buffer('cos', cos)
+        self.register_buffer('sin', sin)
+
+        self.current_pos = 0
+        self.cfg = cfg
+
+    def forward(self, x, cache=None):
+        x = self.tok_emb(x)
+        num_tokens = x.shape[1]
+
+        start = 0
+        if cache:
+            start = self.current_pos
+            end = self.current_pos + num_tokens
+            self.current_pos = end
+
+        for i, block in enumerate(self.trf_blocks):
+            block_cache = cache.get(i) if cache else None
+            x, next_cache = block(x, self.cos, self.sin, start, block_cache)
+            if cache is not None:
+                cache.update(i, next_cache)
+
+        x = self.norm(x)
+        logits = self.out_head(x)
+        return logits
+
+    def reset_cache(self):
+        self.current_pos = 0
+
+class ModelMHA(nn.Module):
+    def __init__(self, cfg, xsa=True):
+        super().__init__()
+        assert cfg['emb_dim'] % cfg['n_heads'] == 0, 'emb_dim must be divisible by n_heads'
+
+        self.tok_emb = nn.Embedding(cfg['vocab_size'], cfg['emb_dim'], dtype=cfg['dtype'])
+        self.trf_blocks = nn.ModuleList(
+            [TransformerMHA(cfg, xsa) for _ in range(cfg['n_layers'])]
+        )
+        self.norm = RMSNorm(cfg['emb_dim'])
+        self.out_head = nn.Linear(
+            cfg['emb_dim'], cfg['vocab_size'], bias=False, dtype=cfg['dtype']
+        )
+
+        # weight tying
+        self.out_head.weight = self.tok_emb.weight
+
+        head_dim = cfg['emb_dim'] // cfg['n_heads']
+
+        cos, sin = compute_rope(
+            head_dim, theta_base=10_000, context_length=cfg['context_length']
+        )
+
+        self.register_buffer('cos', cos)
+        self.register_buffer('sin', sin)
+
+        self.current_pos = 0
+        self.cfg = cfg
+
+    def forward(self, x, cache=None):
+        x = self.tok_emb(x)
+        num_tokens = x.shape[1]
+
+        start = 0
+        if cache:
+            start = self.current_pos
+            end = self.current_pos + num_tokens
+            self.current_pos = end
+
+        for i, block in enumerate(self.trf_blocks):
+            block_cache = cache.get(i) if cache else None
+            x, next_cache = block(x, self.cos, self.sin, start, block_cache)
+            if cache is not None:
+                cache.update(i, next_cache)
+
+        x = self.norm(x)
+        logits = self.out_head(x)
+        return logits
+
+    def reset_cache(self):
+        self.current_pos = 0
+
+class ModelMoE(nn.Module):
+    def __init__(self, cfg, xsa=False):
+        super().__init__()
+        assert cfg['emb_dim'] % cfg['n_heads'] == 0, 'emb_dim must be divisible by n_heads'
+
+        self.tok_emb = nn.Embedding(cfg['vocab_size'], cfg['emb_dim'], dtype=cfg['dtype'])
+        self.trf_blocks = nn.ModuleList(
+            [TransformerMoE(cfg, xsa) for _ in range(cfg['n_layers'])]
         )
         self.norm = RMSNorm(cfg['emb_dim'])
         self.out_head = nn.Linear(
